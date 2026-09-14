@@ -106,7 +106,8 @@ actor:
   enable_offload: True
   model:
     model_path: "/ckpts/pi05_libero_pytorch"
-    num_steps: 5
+    num_action_chunks: 5      # env-executed chunk: replan every 5 steps (openpi protocol); network horizon stays 10
+    num_steps: 5              # flow steps used in RL rollouts/logprobs; set per the chunk5/steps5 base eval (5 if ~0.6-0.7, 10 if >=0.85)
   optim:
     lr: 5.0e-6
     value_lr: 1.0e-4
