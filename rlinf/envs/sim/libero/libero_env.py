@@ -703,6 +703,13 @@ class LiberoEnv(gym.Env):
         self._is_start = value
 
     def _init_metrics(self):
+        # act3 logging: freeze flag (eef displacement < FREEZE_THR per step for >= FREEZE_STEPS consecutive steps while the
+        # gripper is commanded closed) and the across-group action-chunk variance (entropy proxy under GRPO sampling).
+        self._prev_eef = None
+        self._still_count = np.zeros(self.num_envs, dtype=np.int32)
+        self.freeze_entered = np.zeros(self.num_envs, dtype=bool)
+        self._chunk_var_sum = np.zeros(self.num_envs)
+        self._chunk_var_n = np.zeros(self.num_envs)
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
@@ -720,7 +727,10 @@ class LiberoEnv(gym.Env):
             self.returns[mask] = 0
             self.success_episode_len[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            self._still_count[mask] = 0; self.freeze_entered[mask] = False; self._chunk_var_sum[mask] = 0; self._chunk_var_n[mask] = 0
+            if self._prev_eef is not None: self._prev_eef[mask] = np.nan
         else:
+            self._still_count[:] = 0; self.freeze_entered[:] = False; self._chunk_var_sum[:] = 0; self._chunk_var_n[:] = 0; self._prev_eef = None
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
             self.fail_once[:] = False
@@ -741,6 +751,10 @@ class LiberoEnv(gym.Env):
 
         self.success_once = self.success_once | terminations
         episode_info["success_once"] = self.success_once.copy()
+        episode_info["freeze_entered"] = self.freeze_entered.copy()
+        episode_info["success_and_freeze"] = (self.success_once & self.freeze_entered).copy()
+        episode_info["success_and_nofreeze"] = (self.success_once & ~self.freeze_entered).copy()
+        episode_info["chunk_var_group"] = np.where(self._chunk_var_n > 0, self._chunk_var_sum / np.maximum(self._chunk_var_n, 1), 0.0)
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
 
@@ -904,6 +918,17 @@ class LiberoEnv(gym.Env):
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
         self.current_raw_obs = raw_obs
+        try:
+            eef = np.stack([o["robot0_eef_pos"] for o in raw_obs]).astype(np.float64)
+            grip_closed = np.asarray(actions)[:, -1] > 0 if actions is not None else np.zeros(self.num_envs, dtype=bool)
+            if self._prev_eef is None:
+                self._prev_eef = eef.copy()
+            moved = np.linalg.norm(eef - np.nan_to_num(self._prev_eef, nan=1e3), axis=-1)
+            self._still_count = np.where((moved < 3e-4) & grip_closed, self._still_count + 1, 0)
+            self.freeze_entered |= self._still_count >= 30
+            self._prev_eef = eef
+        except Exception:
+            pass
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = None if _skip_obs_wrap else self._wrap_obs(raw_obs)
@@ -930,6 +955,15 @@ class LiberoEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        try:  # act3 logging: variance of the sampled chunk across the group members sharing an init state
+            ca = chunk_actions.detach().cpu().numpy() if isinstance(chunk_actions, torch.Tensor) else np.asarray(chunk_actions)
+            if self.group_size > 1 and ca.shape[0] % self.group_size == 0:
+                g = ca.reshape(-1, self.group_size, ca.shape[1] * ca.shape[2]).astype(np.float64)
+                v = g.var(axis=1, ddof=1).sum(-1)  # trace of the across-group chunk covariance, per group
+                v = np.repeat(v, self.group_size)
+                self._chunk_var_sum += v; self._chunk_var_n += 1
+        except Exception:
+            pass
         obs_list = []
         infos_list = []
 
