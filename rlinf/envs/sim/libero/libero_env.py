@@ -497,10 +497,14 @@ class LiberoEnv(gym.Env):
             validated_tids = sorted(set(validated_tids))
 
             self._valid_reset_state_ids = []
+            trial_filter = self.cfg.get("trial_id_filter", None)  # optional: restrict to these trial (init-state) indices per task
             for tid in validated_tids:
                 start = self.cumsum_trial_id_bins[tid - 1] if tid > 0 else 0
                 end = self.cumsum_trial_id_bins[tid]
-                self._valid_reset_state_ids.extend(range(start, end))
+                ids = range(start, end)
+                if trial_filter is not None:
+                    ids = [start + int(k) for k in trial_filter if start + int(k) < end]
+                self._valid_reset_state_ids.extend(ids)
             self._valid_reset_state_ids = np.array(self._valid_reset_state_ids)
         else:
             self._valid_reset_state_ids = None
