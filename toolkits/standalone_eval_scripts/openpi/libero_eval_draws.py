@@ -14,13 +14,13 @@
 
 import collections
 import json
-import torch
 import math
 import os
 import pathlib
 
 import imageio
 import numpy as np
+import torch
 import tqdm
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -52,6 +52,65 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
+class _SdePolicy:
+    """The training-time sampler: RLinf's OpenPi0ForRLActionPrediction with Flow-SDE noise (mode="train").
+
+    Wraps the model behind the same ``reset`` / ``infer`` interface as the openpi policy so the eval loop is unchanged.
+    ``infer`` takes the raw 256x256 rotated frames and the 8-d state, i.e. exactly what the RLinf env hands the rollout
+    worker, and returns the unnormalized action chunk truncated to ``action_chunk`` as during GRPO rollouts.
+    """
+
+    def __init__(self, args):
+        from omegaconf import OmegaConf
+
+        from rlinf.models.embodiment.openpi import get_model
+
+        cfg = OmegaConf.create(
+            {
+                "model_path": args.pretrained_path,
+                "openpi": {
+                    "config_name": args.config_name,
+                    "num_images_in_input": 2,
+                    "noise_method": "flow_sde",
+                    "noise_level": args.sde_sigma,
+                    "noise_anneal": False,
+                    "action_chunk": args.action_chunk,
+                    "num_steps": args.num_steps,
+                    "action_env_dim": 7,
+                    "train_expert_only": True,
+                    "add_value_head": False,
+                },
+            }
+        )
+        self.model = get_model(cfg).to("cuda").eval()
+
+    def reset(self):
+        pass
+
+    @torch.no_grad()
+    def infer(self, observation):
+        env_obs = {
+            "main_images": torch.as_tensor(
+                np.asarray(observation["observation/image"])
+            )[None],
+            "wrist_images": torch.as_tensor(
+                np.asarray(observation["observation/wrist_image"])
+            )[None],
+            "states": torch.as_tensor(
+                np.asarray(observation["observation/state"], dtype=np.float32)
+            )[None],
+            "task_descriptions": [observation["prompt"]],
+        }
+        actions, _ = self.model.predict_action_batch(
+            env_obs=env_obs, mode="train", compute_values=False
+        )
+        return {"actions": np.asarray(actions[0].detach().cpu(), dtype=np.float32)}
+
+
+def setup_sde_policy(args):
+    return _SdePolicy(args)
+
+
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
@@ -79,9 +138,13 @@ def main(args):
 
     # Set random seed
     np.random.seed(args.seed)
-    if args.noise_seed is not None:  # seeds the flow-matching x0 draw (torch.normal on the global RNG)
-        torch.manual_seed(args.noise_seed); torch.cuda.manual_seed_all(args.noise_seed)
-    ep_out = pathlib.Path(f"{args.log_dir}/{args.exp_name}/episodes.jsonl"); ep_out.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        args.noise_seed is not None
+    ):  # seeds the flow-matching x0 draw (torch.normal on the global RNG)
+        torch.manual_seed(args.noise_seed)
+        torch.cuda.manual_seed_all(args.noise_seed)
+    ep_out = pathlib.Path(f"{args.log_dir}/{args.exp_name}/episodes.jsonl")
+    ep_out.parent.mkdir(parents=True, exist_ok=True)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -105,14 +168,20 @@ def main(args):
 
     # policy setup
     logger.info("policy setup start")
-    policy = setup_policy(args)
-    logger.info("policy setup done")
+    policy = setup_policy(args) if args.sampler == "ode" else setup_sde_policy(args)
+    logger.info(
+        f"policy setup done (sampler={args.sampler}{'' if args.sampler == 'ode' else f', sigma={args.sde_sigma}'})"
+    )
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
     results_per_task = {}
 
-    task_ids = [int(x) for x in args.task_ids.split(",")] if args.task_ids else list(range(num_tasks_in_suite))
+    task_ids = (
+        [int(x) for x in args.task_ids.split(",")]
+        if args.task_ids
+        else list(range(num_tasks_in_suite))
+    )
     for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
@@ -125,7 +194,11 @@ def main(args):
 
         # Start episodes
         task_episodes, task_successes = 0, 0
-        trial_ids = [int(x) for x in args.trial_ids.split(",")] if args.trial_ids else list(range(args.num_trials_per_task))
+        trial_ids = (
+            [int(x) for x in args.trial_ids.split(",")]
+            if args.trial_ids
+            else list(range(args.num_trials_per_task))
+        )
         for episode_idx in trial_ids:
             logger.info(f"\nTask: {task_description}")
             logger.info(f"Starting episode {task_episodes + 1}...")
@@ -140,7 +213,13 @@ def main(args):
 
             # Setup
             replay_images = []
-            prev_eef, still, freeze_entered, freeze_onset, n_steps = None, 0, False, None, 0
+            prev_eef, still, freeze_entered, freeze_onset, n_steps = (
+                None,
+                0,
+                False,
+                None,
+                0,
+            )
 
             for t in range(max_steps + args.num_steps_wait):
                 # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -187,9 +266,15 @@ def main(args):
                 obs, reward, done, info = env.step(action.tolist())
                 n_steps += 1
                 eef = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
-                moved = float(np.linalg.norm(eef - prev_eef)) if prev_eef is not None else 1.0
+                moved = (
+                    float(np.linalg.norm(eef - prev_eef))
+                    if prev_eef is not None
+                    else 1.0
+                )
                 prev_eef = eef
-                still = still + 1 if (moved < 3e-4 and float(action[-1]) > 0) else 0  # same rule as the RLinf env logger
+                still = (
+                    still + 1 if (moved < 3e-4 and float(action[-1]) > 0) else 0
+                )  # same rule as the RLinf env logger
                 if still >= 30 and not freeze_entered:
                     freeze_entered, freeze_onset = True, n_steps - 30
                 if done:
@@ -219,7 +304,20 @@ def main(args):
                 )
 
             with open(ep_out, "a") as f:
-                f.write(json.dumps({"task_id": task_id, "trial": episode_idx, "success": bool(done), "freeze_entered": freeze_entered, "freeze_onset": freeze_onset, "steps": n_steps, "noise_seed": args.noise_seed}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "task_id": task_id,
+                            "trial": episode_idx,
+                            "success": bool(done),
+                            "freeze_entered": freeze_entered,
+                            "freeze_onset": freeze_onset,
+                            "steps": n_steps,
+                            "noise_seed": args.noise_seed,
+                        }
+                    )
+                    + "\n"
+                )
             # Log current results
             logger.info(f"Success: {done}")
             logger.info(f"# episodes completed so far: {total_episodes}")
@@ -321,9 +419,36 @@ if __name__ == "__main__":
         default=10,
         help="Video temporal subsampling rate. Saves every Nth frame to the video to reduce file size",
     )
-    parser.add_argument("--trial_ids", type=str, default="", help="comma-separated init-state ids (default: 0..num_trials_per_task-1)")
-    parser.add_argument("--noise_seed", type=int, default=None, help="torch seed for the flow x0 draws (None = unseeded, as in libero_eval_task.py)")
-    parser.add_argument("--task_ids", type=str, default="", help="comma-separated task ids within the suite (default: all)")
+    parser.add_argument(
+        "--trial_ids",
+        type=str,
+        default="",
+        help="comma-separated init-state ids (default: 0..num_trials_per_task-1)",
+    )
+    parser.add_argument(
+        "--noise_seed",
+        type=int,
+        default=None,
+        help="torch seed for the flow x0 draws (None = unseeded, as in libero_eval_task.py)",
+    )
+    parser.add_argument(
+        "--task_ids",
+        type=str,
+        default="",
+        help="comma-separated task ids within the suite (default: all)",
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=["ode", "sde"],
+        default="ode",
+        help="ode: deployment protocol (openpi deterministic sampler); sde: training protocol (RLinf Flow-SDE sampler, mode=train)",
+    )
+    parser.add_argument(
+        "--sde_sigma",
+        type=float,
+        default=0.5,
+        help="Flow-SDE noise level for --sampler sde (actor.model.openpi.noise_level in the GRPO configs)",
+    )
     parser.add_argument(
         "--seed",
         type=int,
