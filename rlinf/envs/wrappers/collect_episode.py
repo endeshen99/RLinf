@@ -165,6 +165,9 @@ class CollectEpisode(gym.Wrapper):
         self._episode_ids = [0] * num_envs
         self._episode_success = [False] * num_envs
         self._segment_ids: list[int] = [0] * num_envs
+        # Envs whose episode was flushed without an auto-reset keep reporting
+        # done until the next reset; nothing is recorded for them until then.
+        self._finished_until_reset = [False] * num_envs
         self._global_step = 0
         # Holds the post-reset obs for auto-reset envs to prepend to next episode.
         self._pending_obs: list[Any] = [None] * num_envs
@@ -211,6 +214,7 @@ class CollectEpisode(gym.Wrapper):
         self._episode_success = [False] * self.num_envs
         self._pending_obs = [None] * self.num_envs
         self._pending_info = [None] * self.num_envs
+        self._finished_until_reset = [False] * self.num_envs
 
         try:
             obs, info = self.env.reset(seed=seed, options=options)
@@ -287,6 +291,11 @@ class CollectEpisode(gym.Wrapper):
             )
             self._maybe_flush(step_term, step_trunc)
 
+        if all(self._finished_until_reset):
+            # End of a rollout epoch without auto-reset: nothing more is recorded
+            # before the next reset, so land pending writes now instead of
+            # relying on process-exit hooks the scheduler may skip.
+            self._wait_futures()
         return obs_list, rewards, terminations, truncations, infos_list
 
     def close(self):
@@ -380,10 +389,11 @@ class CollectEpisode(gym.Wrapper):
                 self._buffers[env_idx] = self._new_buffer()
                 self._episode_success[env_idx] = False
                 self._segment_ids[env_idx] = 0
+                self._finished_until_reset[env_idx] = False
                 self._seed_reset_frame(env_idx, env_obs)
                 continue
 
-            if pre_record:
+            if pre_record or self._finished_until_reset[env_idx]:
                 continue
 
             if self._bool_from_env_info(env_info, "segment_advance"):
@@ -424,20 +434,28 @@ class CollectEpisode(gym.Wrapper):
     def _maybe_flush(self, terminated, truncated) -> None:
         """Save finished episodes and reset their buffers."""
         for env_idx in range(self.num_envs):
+            if self._finished_until_reset[env_idx]:
+                continue
             is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             done_by_term = self._scalar_flag(terminated, env_idx)
             done_by_trunc = self._scalar_flag(truncated, env_idx)
+            # Without an auto-reset there is no post-reset obs to seed the next
+            # buffer, so the env is finished until the next explicit reset.
+            finished = self._pending_obs[env_idx] is None
             if self.only_success:
                 if is_success and done_by_term:
                     self._flush_episode(env_idx, is_success)
                     self._reset_env_buffer(env_idx)
+                    self._finished_until_reset[env_idx] = finished
                 else:
                     if done_by_trunc:
                         self._reset_env_buffer(env_idx)
+                        self._finished_until_reset[env_idx] = finished
             else:
                 if done_by_term or done_by_trunc:
                     self._flush_episode(env_idx, is_success)
                     self._reset_env_buffer(env_idx)
+                    self._finished_until_reset[env_idx] = finished
 
     def _flush_episode(self, env_idx: int, is_success: bool) -> None:
         """Dispatch a completed episode to the appropriate format writer."""

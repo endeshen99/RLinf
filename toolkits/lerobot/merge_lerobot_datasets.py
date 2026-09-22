@@ -43,7 +43,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+EpisodeRef = tuple[Path, dict, Path]
+"""One discovered episode: ``(dataset_root, episode_meta, parquet_path)``."""
 
 
 def _is_lerobot_dataset(path: Path) -> bool:
@@ -164,6 +167,7 @@ def merge_lerobot_datasets(
     output_dir: str | Path,
     *,
     dry_run: bool = False,
+    select_episodes: Callable[[list[EpisodeRef]], list[EpisodeRef]] | None = None,
 ) -> int:
     """Merge all LeRobot datasets discovered under *source_dirs* into *output_dir*.
 
@@ -171,6 +175,10 @@ def merge_lerobot_datasets(
         source_dirs: One or more root directories to search recursively.
         output_dir: Destination for the merged dataset.
         dry_run: If True, only print what would be done without writing any files.
+        select_episodes: Optional hook applied to the discovered episode list
+            before re-indexing. It returns the subset (and order) to write, which
+            is how callers filter or subsample episodes without touching the
+            merge logic.
 
     Returns:
         Total number of merged episodes.
@@ -247,6 +255,14 @@ def merge_lerobot_datasets(
 
             all_episodes.append((ds_path, ep_meta, parquet_path))
 
+            for task in ep_meta.get("tasks", []):
+                if task not in global_tasks:
+                    global_tasks[task] = len(global_tasks)
+
+    if select_episodes is not None:
+        all_episodes = select_episodes(all_episodes)
+        global_tasks = {}
+        for _, ep_meta, _ in all_episodes:
             for task in ep_meta.get("tasks", []):
                 if task not in global_tasks:
                     global_tasks[task] = len(global_tasks)
@@ -333,7 +349,10 @@ def merge_lerobot_datasets(
                 old_frame_start=old_frame_start,
             )
             merged_episode_stats.append(
-                {"episode_index": new_ep_idx, "stats": new_stats}
+                {
+                    "episode_index": new_ep_idx,
+                    "stats": new_stats,
+                }
             )
 
         global_frame_index += n_frames

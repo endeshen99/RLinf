@@ -1,0 +1,65 @@
+# Task 2 SFT condition, mirroring task2_grpo_step20.yaml: same model class and checkpoint (/ckpts/exports/step20),
+# same precision (null -> fp32 master, bf16 selected params), VLM frozen (train_expert_only), and actor.optim copied
+# verbatim. The trainer is FSDPVlaSftWorker (flow-matching loss on demonstration frames), fed by a LeRobot dataset
+# built with toolkits/lerobot/lerobot_select.py or toolkits/lerobot/libero_hdf5_to_lerobot.py.
+# Budget: runner.max_steps and runner.save_interval are computed per dataset by examples/embodiment/run_task2_sft.sh
+# (1280 episode-passes = 5 iters x 64 eps x 4 update epochs, checkpoints at 25/50/75/100%).
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "/results/task2_sft"
+    project_name: rlinf
+    experiment_name: "task2_sft_step20"
+    logger_backends: ["tensorboard"]
+  max_epochs: -1
+  max_steps: 20               # overridden by run_task2_sft.sh with the episode-pass budget
+  val_check_interval: -1
+  save_interval: 5            # overridden by run_task2_sft.sh (max_steps / 4)
+  resume_dir: null
+
+data:
+  train_data_paths: "/rollouts/task2/sft_data/PLACEHOLDER"   # a lerobot_select.py / libero_hdf5_to_lerobot.py output root
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16
+  global_batch_size: 64       # frames per optimizer step
+  seed: 42
+  model:
+    model_path: "/ckpts/exports/step20"
+    num_action_chunks: 5      # unchanged from GRPO; the SFT loss covers the full 10-step horizon (use_action_chunk_loss is off)
+    num_steps: 10
+  optim:                      # verbatim from task2_grpo_step20.yaml: constant lr, no warmup
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+    weight_decay: 0.01
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
