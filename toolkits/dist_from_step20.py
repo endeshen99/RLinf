@@ -63,6 +63,51 @@ def sample_queries(episodes_glob: str, n: int, seed: int) -> list[tuple[str, int
     return sorted(picked)
 
 
+def sample_queries_shards(root: str, n: int, seed: int) -> list[tuple[str, int]]:
+    """Return ``n`` (parquet_path, row) pairs drawn without replacement over all frames of the LeRobot shards under ``root``."""
+    import pyarrow.parquet as pq
+
+    pool = []
+    for f in sorted(
+        glob.glob(
+            os.path.join(root, "rank_*", "id_*", "data", "chunk-*", "episode_*.parquet")
+        )
+    ):
+        pool.extend((f, i) for i in range(pq.read_metadata(f).num_rows))
+    if n > len(pool):
+        raise SystemExit(
+            f"requested {n} queries but only {len(pool)} frames under {root}"
+        )
+    return sorted(random.Random(seed).sample(pool, n))
+
+
+def shard_obs(cache: dict, f: str, i: int) -> dict:
+    """Build the policy input for row ``i`` of shard parquet ``f`` (256x256 frames as the RLinf env produced them)."""
+    import io
+
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    if f not in cache:
+        t = pq.read_table(f, columns=["image", "wrist_image", "state", "task_index"])
+        root = pathlib.Path(f).parents[3]
+        tasks = {
+            json.loads(l)["task_index"]: json.loads(l)["task"]
+            for l in open(root / "meta" / "tasks.jsonl")
+        }
+        cache[f] = (t, tasks)
+    t, tasks = cache[f]
+    r = t.slice(i, 1).to_pylist()[0]
+    return {
+        "observation/image": np.asarray(Image.open(io.BytesIO(r["image"]["bytes"]))),
+        "observation/wrist_image": np.asarray(
+            Image.open(io.BytesIO(r["wrist_image"]["bytes"]))
+        ),
+        "observation/state": np.asarray(r["state"], dtype=np.float32),
+        "prompt": tasks[r["task_index"]],
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -83,6 +128,11 @@ def main() -> None:
         default="/rollouts/libero_10/t08_put_both_moka_pots_on_the_stove/ep*",
         help="Recorded task-8 rollout episodes.",
     )
+    p.add_argument(
+        "--shards",
+        default=None,
+        help="LeRobot shard root (CollectEpisode layout) to draw observations from instead of --episodes, e.g. /rollouts/task2b/collect_rollouts for task 64.",
+    )
     p.add_argument("--n", type=int, default=500)
     p.add_argument(
         "--seed",
@@ -94,7 +144,11 @@ def main() -> None:
     p.add_argument("--out", required=True)
     a = p.parse_args()
 
-    queries = sample_queries(a.episodes, a.n, a.seed)
+    queries = (
+        sample_queries_shards(a.shards, a.n, a.seed)
+        if a.shards
+        else sample_queries(a.episodes, a.n, a.seed)
+    )
     ref, ckpt = (
         load_policy(a.ref, a.config_name, a.num_steps),
         load_policy(a.ckpt, a.config_name, a.num_steps),
@@ -102,18 +156,21 @@ def main() -> None:
     cache: dict[str, tuple[np.lib.npyio.NpzFile, str]] = {}
     sq, per_dim = [], []
     for q, (d, i) in enumerate(queries):
-        if d not in cache:
-            cache[d] = (
-                np.load(pathlib.Path(d) / "steps.npz"),
-                json.load(open(pathlib.Path(d) / "meta.json"))["task"],
-            )
-        z, task = cache[d]
-        obs = {
-            "observation/image": z["observation__image"][i],
-            "observation/wrist_image": z["observation__wrist_image"][i],
-            "observation/state": z["observation__state"][i],
-            "prompt": task,
-        }
+        if a.shards:
+            obs = shard_obs(cache, d, i)
+        else:
+            if d not in cache:
+                cache[d] = (
+                    np.load(pathlib.Path(d) / "steps.npz"),
+                    json.load(open(pathlib.Path(d) / "meta.json"))["task"],
+                )
+            z, task = cache[d]
+            obs = {
+                "observation/image": z["observation__image"][i],
+                "observation/wrist_image": z["observation__wrist_image"][i],
+                "observation/state": z["observation__state"][i],
+                "prompt": task,
+            }
         outs = []
         for pol in (ref, ckpt):
             torch.manual_seed(
@@ -129,7 +186,7 @@ def main() -> None:
         "ckpt": a.ckpt,
         "n_queries": int(len(sq)),
         "seed": a.seed,
-        "episodes": a.episodes,
+        "episodes": a.shards or a.episodes,
         "chunk_mse_mean": float(sq.mean()),
         "chunk_mse_median": float(np.median(sq)),
         "chunk_mse_max": float(sq.max()),
