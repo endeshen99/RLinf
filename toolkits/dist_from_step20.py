@@ -142,6 +142,11 @@ def main() -> None:
     )
     p.add_argument("--num_steps", type=int, default=10)
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--ref_cache",
+        default=None,
+        help="npz path caching the reference policy's chunks on this query set; created on first use so later runs load only one policy (halves GPU memory).",
+    )
     a = p.parse_args()
 
     queries = (
@@ -149,12 +154,19 @@ def main() -> None:
         if a.shards
         else sample_queries(a.episodes, a.n, a.seed)
     )
-    ref, ckpt = (
-        load_policy(a.ref, a.config_name, a.num_steps),
-        load_policy(a.ckpt, a.config_name, a.num_steps),
+    ref_chunks = None
+    if a.ref_cache and os.path.exists(a.ref_cache):
+        z = np.load(a.ref_cache)
+        if int(z["n"]) == len(queries) and int(z["seed"]) == a.seed:
+            ref_chunks = z["chunks"]
+    ref = (
+        None
+        if ref_chunks is not None
+        else load_policy(a.ref, a.config_name, a.num_steps)
     )
+    ckpt = load_policy(a.ckpt, a.config_name, a.num_steps)
     cache: dict[str, tuple[np.lib.npyio.NpzFile, str]] = {}
-    sq, per_dim = [], []
+    sq, per_dim, new_ref = [], [], []
     for q, (d, i) in enumerate(queries):
         if a.shards:
             obs = shard_obs(cache, d, i)
@@ -176,11 +188,21 @@ def main() -> None:
             torch.manual_seed(
                 a.seed * 100003 + q
             )  # identical x0 for both models on this query
-            outs.append(np.asarray(pol.infer(obs)["actions"], dtype=np.float64))
+            if pol is None:
+                outs.append(np.asarray(ref_chunks[q], dtype=np.float64))
+            else:
+                outs.append(np.asarray(pol.infer(obs)["actions"], dtype=np.float64))
+        if ref is not None:
+            new_ref.append(outs[0])
         diff = (outs[0] - outs[1]) ** 2
         sq.append(diff.mean())
         per_dim.append(diff.mean(0))
     sq = np.asarray(sq)
+    if a.ref_cache and ref is not None:
+        pathlib.Path(a.ref_cache).parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            a.ref_cache, chunks=np.stack(new_ref), n=len(queries), seed=a.seed
+        )
     rep = {
         "ref": a.ref,
         "ckpt": a.ckpt,
