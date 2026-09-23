@@ -100,6 +100,7 @@ class _SdePolicy:
                 np.asarray(observation["observation/state"], dtype=np.float32)
             )[None],
             "task_descriptions": [observation["prompt"]],
+            "extra_view_images": None,
         }
         actions, _ = self.model.predict_action_batch(
             env_obs=env_obs, mode="train", compute_values=False
