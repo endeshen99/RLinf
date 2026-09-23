@@ -90,7 +90,7 @@ def shard_obs(cache: dict, f: str, i: int) -> dict:
 
     if f not in cache:
         t = pq.read_table(f, columns=["image", "wrist_image", "state", "task_index"])
-        root = pathlib.Path(f).parents[3]
+        root = pathlib.Path(f).parents[2]
         tasks = {
             json.loads(l)["task_index"]: json.loads(l)["task"]
             for l in open(root / "meta" / "tasks.jsonl")
