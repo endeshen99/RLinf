@@ -294,11 +294,33 @@ def merge_lerobot_datasets(
     global_frame_index = 0
     merged_episode_metas: list[dict] = []
     merged_episode_stats: list[dict] = []
+    # Every episode is projected onto the reference dataset's feature columns so sources
+    # with extra per-frame fields (e.g. CollectEpisode's segment_id) merge with sources
+    # that lack them; a missing column is filled with a typed default.
+    ref_columns = (
+        list(reference_info.get("features", {}).keys()) if reference_info else None
+    )
+    ref_schema_metadata = None
 
     for new_ep_idx, (ds_path, ep_meta, parquet_path) in enumerate(all_episodes):
         table = pq.read_table(parquet_path)
         df = table.to_pandas()
         n_frames = len(df)
+        if ref_columns:
+            for col in ref_columns:
+                if col not in df.columns:
+                    dtype = reference_info["features"][col].get("dtype", "float32")
+                    fill = (
+                        [False]
+                        if dtype == "bool"
+                        else [0]
+                        if dtype in ("int64", "uint8")
+                        else [0.0]
+                    )
+                    df[col] = [fill] * n_frames
+            df = df[[c for c in ref_columns if c in df.columns]]
+        if ref_schema_metadata is None and ds_path == all_episodes[0][0]:
+            ref_schema_metadata = table.schema.metadata
 
         old_ep_idx: int = ep_meta["episode_index"]
         old_frame_start = int(df["index"].min()) if "index" in df.columns else 0
@@ -320,9 +342,11 @@ def merge_lerobot_datasets(
 
         # Rebuild table preserving original schema metadata
         new_table = pa.Table.from_pandas(df, preserve_index=False)
-        # Carry over any existing schema-level metadata (e.g. HuggingFace tags)
-        if table.schema.metadata:
-            new_schema = new_table.schema.with_metadata(table.schema.metadata)
+        # Carry over the reference dataset's schema-level metadata (HuggingFace feature
+        # description) so every episode advertises the same feature set.
+        meta = ref_schema_metadata or table.schema.metadata
+        if meta:
+            new_schema = new_table.schema.with_metadata(meta)
             new_table = new_table.cast(new_schema)
         pq.write_table(new_table, out_parquet)
 
