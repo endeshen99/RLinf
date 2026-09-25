@@ -26,6 +26,11 @@ from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 class FSDPVlaSftWorker(FSDPSftWorker):
     def __init__(self, cfg: DictConfig):
+        # Seed the flow-matching noise and any other torch sampling in the loss from
+        # actor.seed (offset by rank) before the model and data loader are built.
+        seed = int(cfg.actor.get("seed", 0)) + int(os.environ.get("RANK", "0"))
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         super().__init__(cfg)
 
     def build_dataloader(self, data_paths: Any, eval_dataset: bool = False):

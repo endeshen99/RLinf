@@ -58,13 +58,17 @@ def build_official_openpi_sft_dataloader(
         repo_id=repo_id,
         data_kwargs=getattr(model_cfg, "openpi_data", None),
     )
+    # actor.seed drives the loader's shuffle order for both model types so a run's
+    # data order is reproducible from the config alone.
+    config = dataclasses.replace(
+        config, seed=int(OmegaConf.select(cfg, "actor.seed", default=config.seed))
+    )
     if model_type == SupportedModel.OPENPI_RLINF:
         config = dataclasses.replace(
             config,
             num_workers=int(
                 OmegaConf.select(cfg, "data.num_workers", default=config.num_workers)
             ),
-            seed=int(OmegaConf.select(cfg, "actor.seed", default=config.seed)),
         )
         _validate_openpi_rlinf_model_shape(model_cfg, config)
 
